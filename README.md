@@ -1,5 +1,7 @@
 # SkinSafe AI 🧴🤖
 
+![SkinSafe AI Demo](demo.png)
+
 Instantly analyze product ingredient lists with AI to determine if they’re safe for **eczema** and **malassezia**-prone skin.
 
 ---
