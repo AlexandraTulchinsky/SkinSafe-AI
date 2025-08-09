@@ -34,7 +34,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ## 📂 Project Structure (Key Files)
 
 * `main.py` → FastAPI backend entry point.
-* `classify_image_with_clip.py` → Classifies image type.
-* `extract_ingredients_easyocr.py` → Extracts ingredients from text.
-* `step2_food.py` → Identifies food items & matches against triggers.
-* `step3_final.py` → LLM-powered safe/avoid classification.
+* `classify_item.py` → Classifies image type.
+* `ingredient_list.py` → Extracts ingredients from text.
+* `identify_food.py` → Identifies food items & matches against triggers.
+* `recommend.py` → LLM-powered safe/avoid classification.
