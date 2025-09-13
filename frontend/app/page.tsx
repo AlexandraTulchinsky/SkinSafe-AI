@@ -286,7 +286,7 @@ export default function SkinSafeAI() {
       const result = await response.json()
       console.log("🔍 DEBUG: API response received:", result)
       console.log("🔍 DEBUG: Python API response:", result.python_api_response)
-
+      console.log("🔍 DEBUG raw backend response:", result);   
       setAnalysisResult(result)
       setScanComplete(true)
 
@@ -316,7 +316,7 @@ export default function SkinSafeAI() {
   // Determine if product is safe based on avoid ingredients
   const getProductSafety = () => {
     if (analysisResult?.success && analysisResult.ingredients) {
-      const hasAvoidIngredients = analysisResult.ingredients.avoid.length > 0
+      const hasAvoidIngredients = (analysisResult.ingredients.avoid?.length ?? 0) > 0
       return {
         isSafe: !hasAvoidIngredients,
         text: hasAvoidIngredients ? "⚠️ Not Safe to Use" : "✓ Safe to Use",
@@ -549,15 +549,18 @@ export default function SkinSafeAI() {
                         <span className="font-medium text-green-800">Safe Ingredients</span>
                         {analysisResult?.success && (
                           <span className="text-xs text-green-600">
-                            ({analysisResult.ingredients?.safe.length || 0} found)
+                            ({analysisResult.ingredients?.safe?.length ?? 0} found)
                           </span>
                         )}
                       </div>
                       <p className="text-sm text-green-700">
-                        {analysisResult?.success && analysisResult.ingredients
+                      {analysisResult?.success && analysisResult.ingredients
+                        ? (analysisResult.ingredients.safe?.length ?? 0) > 0
                           ? analysisResult.ingredients.safe.join(", ")
-                          : previewData.safe.join(", ")}
-                      </p>
+                          : "No safe ingredients found."
+                        : previewData.safe.join(", ")}
+                    </p>
+
                     </div>
 
                     {/* Avoid Ingredients */}
@@ -567,15 +570,18 @@ export default function SkinSafeAI() {
                         <span className="font-medium text-red-800">Avoid</span>
                         {analysisResult?.success && (
                           <span className="text-xs text-red-600">
-                            ({analysisResult.ingredients?.avoid.length || 0} found)
+                            ({analysisResult.ingredients?.avoid?.length ?? 0} found)
                           </span>
                         )}
                       </div>
                       <p className="text-sm text-red-700">
-                        {analysisResult?.success && analysisResult.ingredients
+                      {analysisResult?.success && analysisResult.ingredients
+                        ? (analysisResult.ingredients.avoid?.length ?? 0) > 0
                           ? analysisResult.ingredients.avoid.join(", ")
-                          : previewData.avoid.join(", ")}
-                      </p>
+                          : "No avoid ingredients found."
+                        : previewData.avoid.join(", ")}
+                    </p>
+
                     </div>
                   </div>
                 )}

@@ -1,14 +1,41 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Simple ingredient-label OCR pipeline:
+1. EasyOCR first (fast, accurate on packaging)
+2. Tesseract fallback if EZ-OCR output looks like gibberish
+3. Vision model fallback (Ollama) if both fail
+"""
+
 from __future__ import annotations
-
-import logging
-import re
-import sys
+import os, re, sys, time, logging, base64
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
-
+from typing import List, Union
+import cv2
 import numpy as np
 from PIL import Image
-import easyocr
+import requests
+from io import BytesIO
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
+    import easyocr
+except Exception:
+    easyocr = None
+
+# ---------------------- config & logging ----------------------
+_MIN_SIDE = int(os.getenv("OCR_MIN_SIDE", "800"))
+_MIN_GOOD_TOK = int(os.getenv("OCR_MIN_GOOD_TOK", "3"))
+_TESS_TIMEOUT_S = max(0.1, float(os.getenv("OCR_TESS_TIMEOUT_MS", "1000")) / 1000.0)
+
+# Vision model settings
+_OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2-vision:latest")
+_OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "10000"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,78 +44,144 @@ logging.basicConfig(
 )
 log = logging.getLogger("ingredient_ocr")
 
-_DEFAULT_LANGS: Sequence[str] = ("en", "fr")
-_STOP_AT: Sequence[str] = [
-    "contains", "ingrédients",  # English / French
-    "nutrition", "valeur",      # nutrition panels
-    "allergen", "allergy", "Ingredients"
-]
-_SEPARATORS = r"[•·\*\+|;]"  # bullets, mid-dots, unusual delimiters
+_LANG = "eng"
+_PSM = "--psm 6"
+_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ,.;:()[]-/+%&'"
 
-# EasyOCR Reader singleton (lazy load)
-_ocr_reader: Optional[easyocr.Reader] = None
+_SEPARATORS = r"[•·\*\+|;∙●◦/:]"
 
+# ---------------------- utils ----------------------
+def _ensure_bgr(img: Union[str, Path, np.ndarray, Image.Image]) -> np.ndarray:
+    if isinstance(img, (str, Path)):
+        bgr = cv2.imread(str(img))
+        if bgr is None:
+            raise FileNotFoundError(f"Image not found: {img}")
+        return bgr
+    if isinstance(img, Image.Image):
+        return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    if isinstance(img, np.ndarray):
+        return img
+    raise TypeError(f"Unsupported type: {type(img)}")
 
-def ocr_easy(src: Union[str, Path, np.ndarray, Image.Image],
-             lang: Sequence[str] = _DEFAULT_LANGS) -> str:
-    global _ocr_reader
-    if _ocr_reader is None:
-        log.debug("Initializing EasyOCR Reader with languages: %s", lang)
-        _ocr_reader = easyocr.Reader(lang, gpu=False)
+def _resize(bgr: np.ndarray, min_side: int = _MIN_SIDE) -> np.ndarray:
+    h, w = bgr.shape[:2]
+    s = min(h, w)
+    if s >= min_side: return bgr
+    scale = float(min_side) / float(s)
+    return cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
 
-    if isinstance(src, (str, Path)):
-        result = _ocr_reader.readtext(str(src), detail=0, paragraph=True)
-    else:
-        result = _ocr_reader.readtext(src, detail=0, paragraph=True)
+def _normalize_text(s: str) -> str:
+    s = s.replace("ﬁ", "fi").replace("ﬂ", "fl")
+    s = s.replace("’", "'").replace("`", "'").replace("‘", "'")
+    s = s.replace("“", '"').replace("”", '"')
+    s = s.replace("—", "-").replace("–", "-")
+    return re.sub(r"[ \t]+", " ", s)
 
-    return "\n".join(result)
+def _clean_and_split(block: str) -> List[str]:
+    s = _normalize_text(block)
+    s = re.sub(_SEPARATORS, ",", s)
+    s = s.replace("(", ",").replace(")", ",")
+    s = re.sub(r"\band\/or\b", ",", s, flags=re.I)
+    s = re.sub(r"\s+(?:and|or)\s+", ",", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s)
 
-
-def extract_block(txt: str) -> Optional[str]:
-    """
-    Find the substring that follows 'Ingredients:' / 'Ingredients',
-    stopping at the first stop word (e.g., 'Contains', 'Nutrition').
-
-    Returns None if no ingredient header is found.
-    """
-    m = re.search(r"ingredients?\s*[:\-]?\s*", txt, re.IGNORECASE)
-    if not m:
-        return None
-
-    sub = txt[m.end():]
-    for stop_word in _STOP_AT:
-        m2 = re.search(stop_word, sub, re.IGNORECASE)
-        if m2:
-            sub = sub[:m2.start()]
-            break
-    return sub
-
-
-def clean_split(block: str) -> List[str]:
-    
-    block = re.sub(_SEPARATORS, ",", block)
-
-    block = re.sub(r"[\(\[]", ",", block)
-    block = re.sub(r"[\)\]]", ",", block)
-
-    block = re.sub(r"\band\/or\b", ",", block, flags=re.IGNORECASE)
-    block = re.sub(r"\band\b", ",", block, flags=re.IGNORECASE)
-
-    parts = re.split(r"[,\n]", block)
-
-    tokens = [p.strip().lower() for p in parts if p.strip()]
-
-    seen, final = set(), []
-    for t in tokens:
+    parts = re.split(r"[,\n]", s)
+    seen, out = set(), []
+    for p in parts:
+        t = p.strip().lower().strip(" .;:")
+        if not t: continue
+        if len(t) < 2: continue
         if t not in seen:
             seen.add(t)
-            final.append(t)
+            out.append(t)
+    return out
 
-    return final
+def _tokens_look_valid(tokens: List[str], min_good: int = _MIN_GOOD_TOK) -> bool:
+    return sum(1 for t in tokens if re.search(r"[A-Za-z]{3,}", t)) >= min_good
 
+# ---------------------- OCR engines ----------------------
+_EASYREADER = None
+def _easyocr_tokens(bgr: np.ndarray) -> List[str]:
+    global _EASYREADER
+    if easyocr is None: return []
+    if _EASYREADER is None:
+        _EASYREADER = easyocr.Reader(["en"], gpu=True)
+    try:
+        out = _EASYREADER.readtext(bgr, detail=0, paragraph=True)
+        txt = _normalize_text(" ".join([r for r in out if r and r.strip()]))
+        print(f"[RAW EASY] {txt}", flush=True)
+        return _clean_and_split(txt)
+    except Exception as e:
+        log.warning("EasyOCR failed: %s", e)
+        return []
 
-def extract_ingredients_label(img_or_path: Union[str, Path, np.ndarray, Image.Image]) -> List[str]:
-    raw_text = ocr_easy(img_or_path)
-    block = extract_block(raw_text)
-    return clean_split(block) if block else []
+def _tesseract_tokens(bgr: np.ndarray) -> List[str]:
+    if pytesseract is None: return []
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    cfg = f'{_PSM} --oem 1 -c preserve_interword_spaces=1 -c user_defined_dpi=300 -c tessedit_char_whitelist={_WHITELIST}'
+    try:
+        txt = pytesseract.image_to_string(rgb, lang=_LANG, config=cfg, timeout=_TESS_TIMEOUT_S)
+        txt = _normalize_text(txt or "")
+        print(f"[RAW TESS] {txt}", flush=True)
+        return _clean_and_split(txt)
+    except Exception as e:
+        log.warning("Tesseract failed: %s", e)
+        return []
 
+def _jpeg_b64_for_vision(img: np.ndarray, max_side: int = 768, quality: int = 85) -> str:
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m > max_side:
+        scale = max_side / float(m)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+    buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])[1]
+    return base64.b64encode(buf).decode("utf-8")
+
+def _vision_tokens(bgr: np.ndarray) -> List[str]:
+    b64 = _jpeg_b64_for_vision(bgr)
+    url = f"{_OLLAMA_URL.rstrip('/')}/api/chat"
+    prompt = (
+        "Extract all ingredients from this image. "
+        "Return as a comma-separated list of short tokens."
+    )
+    payload = {
+        "model": _VISION_MODEL,
+        "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+        "stream": False,
+        "options": {"num_predict": 64, "num_gpu": 0},
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=_OLLAMA_TIMEOUT)
+        r.raise_for_status()
+        txt = (r.json().get("message", {}).get("content") or "").strip()
+        print(f"[RAW VISION] {txt}", flush=True)
+        return _clean_and_split(txt)
+    except Exception as e:
+        log.warning("Vision fallback failed: %s", e)
+        return []
+
+# ---------------------- public API ----------------------
+def extract_ingredients_label(img: Union[str, Path, np.ndarray, Image.Image]) -> List[str]:
+    bgr = _ensure_bgr(img)
+    bgr = _resize(bgr, _MIN_SIDE)
+
+    # Step 1: EasyOCR
+    tokens = _easyocr_tokens(bgr)
+    if _tokens_look_valid(tokens):
+        log.info("EasyOCR accepted: %d tokens", len(tokens))
+        return tokens
+
+    # Step 2: Tesseract fallback
+    tokens = _tesseract_tokens(bgr)
+    if _tokens_look_valid(tokens):
+        log.info("Tesseract accepted: %d tokens", len(tokens))
+        return tokens
+
+    # Step 3: Vision fallback
+    tokens = _vision_tokens(bgr)
+    if _tokens_look_valid(tokens):
+        log.info("Vision accepted: %d tokens", len(tokens))
+        return tokens
+
+    log.warning("No valid OCR result")
+    return []

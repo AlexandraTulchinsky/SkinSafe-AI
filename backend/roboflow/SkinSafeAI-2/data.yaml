@@ -1,0 +1,13 @@
+names:
+- barcode
+- ingredients
+nc: 2
+roboflow:
+  license: Private
+  project: skinsafeai-3mupa
+  url: https://universe.roboflow.com/test-mm1q9/skinsafeai-3mupa/dataset/2
+  version: 2
+  workspace: test-mm1q9
+test: ../test/images
+train: ../train/images
+val: ../valid/images

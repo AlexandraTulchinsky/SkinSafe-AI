@@ -15,7 +15,7 @@ import requests
 log = logging.getLogger(__name__)
 
 FOOD_API_TEMPLATE: str = "https://world.openfoodfacts.org/api/v2/product/{code}.json"
-HTTP_TIMEOUT_S: int = 10
+HTTP_TIMEOUT_S: int = 20
 
 # OCR config
 OCR_LANGS: Sequence[str] = ("en",)

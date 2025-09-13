@@ -16,11 +16,10 @@ if not log.handlers:
 
 _MODEL_ID = "openai/clip-vit-base-patch32"
 _LABELS: List[str] = [
-    "a photo of a food item",
-    "a photo of ingredient list",
-    "barcode",
-    "a person",
-    "other object",
+    "photo of cooked food on a plate",
+    "ingredients text panel on food packaging",
+    "black and white barcode on packaging",
+    "other type of packaging or logo",
 ]
 
 _model: CLIPModel | None = None

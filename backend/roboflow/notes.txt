@@ -1,0 +1,7 @@
+python train.py --data_root SkinSafeAI-2 --pretrained yolov8n.pt --epochs 50 --imgsz 640 --batch 16 --device 0
+
+=== Cleanup Summary ===
+train: 10 files removed
+valid: 1 files removed
+test: 1 files removed
+=======================

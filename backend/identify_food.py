@@ -1,28 +1,38 @@
+# vision.py
+# -----------------------------------------------------------------------------
+# Returns a PLAIN LIST of food/ingredient tokens from an image.
+# No trigger scanning or DB logic here — just vision -> caption -> tokens.
+#
+# Public API:
+#   - identify_food_items(img) -> List[str]
+#   - identify_food_items_batch(imgs, batch_size=8) -> List[List[str]]
+#
+# Behavior:
+#   1) (Optional) Ask vision model if image is FOOD vs NOT_FOOD (cheap guard).
+#   2) Caption with Ollama (llama3.2-vision or your chosen vision model).
+#   3) Parse caption into short, singularized tokens (≤ 3 words), dedup, order-preserving.
+# -----------------------------------------------------------------------------
+
 from __future__ import annotations
 
-import concurrent.futures as cf
-import json
+import base64
+import logging
 import os
 import re
 import sys
-from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Union, Optional
 
 import inflect
+import requests
 import spacy
-import torch
+import subprocess
 from PIL import Image
-from transformers import GitForCausalLM, GitProcessor
 
-import openai
-
-
-os.environ.setdefault(
-    "OPENAI_API_KEY",
-)
-
-import logging
+# --------------------------------------------------------------------------------------
+# Env / logging
+# --------------------------------------------------------------------------------------
 
 LOG_LEVEL = os.getenv("STEP2_LOGLEVEL", "INFO").upper()
 logging.basicConfig(
@@ -32,260 +42,231 @@ logging.basicConfig(
 )
 log = logging.getLogger("step2_food")
 
+# --------------------------------------------------------------------------------------
+# NLP helpers
+# --------------------------------------------------------------------------------------
+
 _inflect = inflect.engine()
-# keep spacy config identical (no lemmatizer, ner, parser)
+# keep spaCy config minimal (token POS tagging only)
 _nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "lemmatizer", "textcat"])
 
-# Data file lives next to this script
-_DATA = Path(__file__).with_name("cross_ref_food.json")
+def _sg(phrase: str) -> str:
+    """Singularize the last word of a phrase, preserving the rest."""
+    phrase = phrase.strip()
+    if not phrase:
+        return phrase
+    parts = phrase.split()
+    last = _inflect.singular_noun(parts[-1]) or parts[-1]
+    return " ".join([*parts[:-1], last])
 
-# Captioning
-_CAP_TOK: int = 16
+# --------------------------------------------------------------------------------------
+# Ollama Vision configuration
+# --------------------------------------------------------------------------------------
 
-# Types
-TriggerMap = Dict[str, List[str]]
-AdviceMap = Dict[str, Optional[List[str]]]
+_CAP_TOK: int = int(os.getenv("VISION_CAP_TOK", "16"))  # small, concise captions
 
-@lru_cache(maxsize=128)
-def _is_food(token: str) -> bool:
-    """
-    Ask GPT-4o/mini to answer: “Is <token> an edible food item?”
-    Returns True on “YES”, False on “NO”.
-    Fails open (True) on exceptions, preserving original behavior.
-    """
-    prompt = (
-   
-        "Reply with exactly one word: YES or NO (no punctuation).\n\n"
- 
-        "Say YES if the term names something that can be eaten or drunk "
-        "directly OR is commonly used as a culinary ingredient. "
-        "This includes category words such as 'cheese', 'bread', 'pasta', "
-        "'burger', 'yogurt', 'juice'.\n"
- 
-        "Say NO if the term is generic ('food', 'dish', 'ingredient'), "
-        "a utensil, a quantity word ('bunch'), a colour, or anything non-edible.\n\n"
-  
-        f"Term: {token}"
-    )
+_OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+_LLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2-vision:latest")
 
-    try:
-        resp = openai.chat.completions.create(
-            model="gpt-4o-mini", 
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        )
-        out = (resp.choices[0].message.content or "").strip().upper()
-        return out.startswith("Y")
-    except Exception as e:
-        log.debug("LLM check failed for %r (%s); failing open as True", token, e)
-        return True  
+# Warmup toggles (disable by setting 0)
+_WARMUP_OLLAMA = os.getenv("WARMUP_OLLAMA", "1") != "0"
 
-@lru_cache(maxsize=1)
-def _load_caption() -> Tuple[GitProcessor, GitForCausalLM]:
+# Request timeout (ms → s)
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "10000000"))
 
-    proc = GitProcessor.from_pretrained("microsoft/git-large-coco")
-
-    # try 8-bit only if bitsandbytes + CUDA present
-    try:
-        from transformers import BitsAndBytesConfig
-
-        if torch.cuda.is_available():
-            cfg = BitsAndBytesConfig(load_in_8bit=True)
-            mdl = GitForCausalLM.from_pretrained(
-                "microsoft/git-large-coco",
-                device_map="auto",
-                quantization_config=cfg,
-                torch_dtype=torch.float16,
-            )
-            return proc, mdl
-    except Exception:
-
-        pass
-
-    mdl = GitForCausalLM.from_pretrained(
-        "microsoft/git-large-coco",
-        device_map="cpu",
-        torch_dtype=torch.float32,
-    )
-    return proc, mdl
+# --------------------------------------------------------------------------------------
+# Image utilities
+# --------------------------------------------------------------------------------------
 
 def _rgb(im: Image.Image | str | Path) -> Image.Image:
-    """Ensure a PIL RGB image from path or Image; behavior identical."""
-    return im.convert("RGB") if isinstance(im, Image.Image) else Image.open(im).convert("RGB")
+    """Ensure a PIL RGB image from path or Image."""
+    if isinstance(im, Image.Image):
+        return im.convert("RGB")
+    return Image.open(im).convert("RGB")
 
-def _sg(word: str) -> str:
-    """Singularize the last token of a possibly multi-word phrase (order preserving)."""
-    *head, last = word.split()
-    last = _inflect.singular_noun(last) or last
-    return " ".join([*head, last])
+def _jpeg_b64_for_vision(img: Image.Image, max_side: int = 768, quality: int = 85) -> str:
+    """
+    Downscale the longer side to ≤ max_side and encode as JPEG base64 string.
+    Keeps payloads small to avoid timeouts.
+    """
+    w, h = img.size
+    m = max(w, h)
+    im = img
+    if m > max_side:
+        scale = max_side / float(m)
+        im = img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
+    buf = BytesIO()
+    im.save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+# --------------------------------------------------------------------------------------
+# Vision model calls
+# --------------------------------------------------------------------------------------
+
+def _llama_caption_prompt() -> str:
+    return (
+        "List all visible foods and ingredients in the image. "
+        "Be specific: include individual components (e.g., bun, beef patty, cheese, lettuce, tomato). "
+        "Output as a short comma-separated list of ingredients only, no full sentences."
+    )
+
+def _warmup_vision_cpu() -> None:
+    """
+    Warm up the vision model on CPU so a different model (e.g., Dolphin) can keep the GPU.
+    Spawn once; non-blocking. Safe to fail.
+    """
+    if not _WARMUP_OLLAMA:
+        return
+    try:
+        subprocess.Popen(
+            ["ollama", "run", "--cpu", _LLAMA_VISION_MODEL, "warmup"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("Warmup requested for vision model on CPU: %s", _LLAMA_VISION_MODEL)
+    except Exception as e:
+        log.warning("Vision warmup failed (non-fatal): %s", e)
+
+# Call warmup once at import
+_warmup_vision_cpu()
+
+def _vision_is_food(img_b64: str) -> Optional[bool]:
+    """
+    Ask the vision model to classify the image as FOOD or NOT_FOOD.
+    Returns True/False, or None on error/timeouts.
+    """
+    url = f"{_OLLAMA_URL}/api/chat"
+    prompt = (
+        "Answer with exactly one word: FOOD or NOT_FOOD.\n"
+        "FOOD = cooked/raw meals, dishes, snacks, drinks, packaged food.\n"
+        "NOT_FOOD = ingredient label text, barcodes, documents, scenery, people, objects."
+    )
+    payload = {
+        "model": _LLAMA_VISION_MODEL,
+        "messages": [{"role": "user", "content": prompt, "images": [img_b64]}],
+        "stream": False,
+        "options": {
+            "num_predict": 3,      # tiny
+            "keep_alive": "30m",
+            "num_gpu": 0,          # force CPU for this model
+        },
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=max(1, OLLAMA_TIMEOUT // 100))
+        r.raise_for_status()
+        out = (r.json().get("message", {}).get("content") or "").strip().upper()
+        log.debug("Vision FOOD/NOT_FOOD raw: %r", out)
+        if out.startswith("FOOD"):
+            return True
+        if out.startswith("NOT_FOOD"):
+            return False
+    except requests.exceptions.ReadTimeout:
+        log.warning("Vision FOOD/NOT_FOOD timed out")
+    except Exception as e:
+        log.error("Vision FOOD/NOT_FOOD failed: %s", e)
+    return None
+
+def _ollama_chat_caption(img_b64: str, num_predict: int = _CAP_TOK) -> str:
+    """
+    Ask the vision model for a concise, comma-separated ingredient list.
+    Returns raw text (we’ll parse into tokens).
+    """
+    url = f"{_OLLAMA_URL}/api/chat"
+    payload = {
+        "model": _LLAMA_VISION_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": _llama_caption_prompt(),
+            "images": [img_b64],
+        }],
+        "stream": False,
+        "options": {
+            "num_predict": int(num_predict),
+            "keep_alive": "30m",
+            "num_gpu": 0,  # run on CPU
+        },
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(url, json=payload, timeout=max(3, OLLAMA_TIMEOUT // 10))
+            r.raise_for_status()
+            content = (r.json().get("message", {}).get("content") or "").strip()
+            log.debug("Vision caption raw: %r", content)
+            return content
+        except requests.exceptions.ReadTimeout:
+            log.warning("Vision caption timed out (attempt %d/3)", attempt + 1)
+        except Exception as e:
+            log.error("Ollama caption call failed: %s", e)
+            break
+    return ""
+
+# --------------------------------------------------------------------------------------
+# Caption → tokens
+# --------------------------------------------------------------------------------------
 
 def _caption2foods(text: str) -> List[str]:
     """
-    Extract candidate food tokens from a caption:
-      • single NOUNs (alphabetic)
-      • ADJ + NOUN bigrams
-      • singularize final token
-      • limit to ≤3 words
-      • confirm with _is_food() via LLM (unchanged)
+    Turn a caption into short tokens:
+      - Try comma-split (expected),
+      - If too few, fall back to spaCy (NOUNs and ADJ+NOUN bigrams),
+      - Keep tokens ≤ 3 words,
+      - Singularize the last word,
+      - Deduplicate while preserving order.
     """
-    doc = _nlp(text.lower())
-    out: set[str] = set()
+    if not text:
+        return []
 
+    parts = [p.strip().lower() for p in text.split(",") if p.strip()]
+    tokens: List[str] = []
 
-    out.update(tok.text for tok in doc if tok.pos_ == "NOUN" and tok.is_alpha)
+    seen = set()
+    for p in parts:
+        if len(p.split()) <= 3:
+            s = _sg(p)
+            if s and s not in seen:
+                seen.add(s)
+                tokens.append(s)
 
-    # ADJ + NOUN bigrams
-    out.update(
-        f"{doc[i-1].text} {tok.text}"
-        for i, tok in enumerate(doc)
-        if tok.pos_ == "NOUN" and i and doc[i - 1].pos_ == "ADJ"
-    )
+    # Fallback for sentence-like captions
+    if len(tokens) < 2:
+        doc = _nlp(text.lower())
+        candidates: List[str] = []
+        for i, tok in enumerate(doc):
+            if tok.pos_ == "NOUN" and tok.is_alpha:
+                candidates.append(tok.text)
+                if i and doc[i - 1].pos_ == "ADJ":
+                    candidates.append(f"{doc[i - 1].text} {tok.text}")
 
-    # ≤3 tokens, singularize tail
-    cands = {_sg(w) for w in out if len(w.split()) <= 3}
+        seen2 = set()
+        for w in candidates:
+            if len(w.split()) <= 3:
+                s = _sg(w)
+                if s and s not in seen2:
+                    seen2.add(s)
+                    tokens.append(s)
 
-    # keep only LLM-confirmed foods (preserves original behavior)
-    cands = {w for w in cands if _is_food(w)}
+    return tokens
 
-    return sorted(cands)
+# --------------------------------------------------------------------------------------
+# Public API (PLAIN LIST ONLY)
+# --------------------------------------------------------------------------------------
 
 def identify_food_items(img: Image.Image | str | Path) -> List[str]:
     """
-    Single-image path/PIL → caption (GIT) → candidate foods (≤3 tokens).
+    Photo → (optional FOOD/NOT_FOOD) → caption → tokens.
+    Always returns a plain list of ingredient/food tokens (lowercase).
+    Returns [] on failure or NOT_FOOD classification.
     """
-    proc, mdl = _load_caption()
-    inputs = proc(images=_rgb(img), return_tensors="pt").to(mdl.device)
-    ids = mdl.generate(**inputs, max_new_tokens=_CAP_TOK)
-    caption = proc.decode(ids[0], skip_special_tokens=True)
-    return _caption2foods(caption)
+    pil = _rgb(img)
+    b64 = _jpeg_b64_for_vision(pil, max_side=768, quality=85)
 
-def identify_food_items_batch(imgs: Iterable[Image.Image | str | Path], batch_size: int = 8) -> List[List[str]]:
-    """
-    Batched variant; preserves original batching semantics and outputs list per image.
-    """
-    proc, mdl = _load_caption()
-    pil_imgs = [_rgb(i) for i in imgs]
-    if not pil_imgs:
+    is_food = _vision_is_food(b64)
+    if is_food is False:
+        log.info("Vision says NOT_FOOD; skipping caption")
         return []
+    # If None (error), still attempt caption once.
 
-    bag: List[List[str]] = []
-    for i in range(0, len(pil_imgs), batch_size):
-        batch = pil_imgs[i : i + batch_size]
-        inputs = proc(images=batch, return_tensors="pt").to(mdl.device)
-        ids = mdl.generate(**inputs, max_new_tokens=_CAP_TOK)
-        bag.extend(_caption2foods(t) for t in proc.batch_decode(ids, skip_special_tokens=True))
-    return bag
-
-def _canon(k: str) -> str:
-    return re.sub(r"[^a-z]", "_", k.lower()).strip("_")
-
-_SPLIT = re.compile(r"[,&;]|\b(?:and|or)\b", re.I)
-_TRSH = re.compile(r"\b(certain|various|other|also|like)\b", re.I)
-
-def _split(t: str) -> List[str]:
-    t = re.sub(r"[()–—-]", ",", _TRSH.sub("", t))
-    return [s.strip().lower() for s in _SPLIT.split(t) if s.strip()]
-
-@lru_cache(maxsize=None)
-def _pat(phrase: str) -> re.Pattern[str]:
-    parts = phrase.split()
-    sg_last = _inflect.singular_noun(parts[-1]) or parts[-1]
-    pl_last = _inflect.plural_noun(sg_last) or sg_last
-    head = " ".join(parts[:-1])
-    head_escaped = f"{re.escape(head)} " if head else ""
-    return re.compile(rf"\b{head_escaped}(?:{re.escape(sg_last)}|{re.escape(pl_last)})\b", re.I)
-
-@lru_cache(maxsize=1)
-def _db() -> Dict[str, object]:
-    """
-    Load and compile the trigger DB into regex patterns.
-    Structure of cross_ref_food.json is preserved.
-    """
-    raw = json.load(_DATA.open())
-    out: Dict[str, object] = {}
-
-    for k, v in raw.items():
-        key = _canon(k)
-        if isinstance(v, dict):
-            # nested categories → dict[str, list[Pattern]]
-            out[key] = {
-                c: [_pat(t) for e in foods for t in _split(e) if len(t.split()) <= 3]
-                for c, foods in v.items()
-            }
-        else:
-            # flat list → list[Pattern] (order-preserving unique)
-            seen_list: List[str] = []
-            seen_set: set[str] = set()
-            for e in v:
-                for t in _split(e):
-                    if len(t.split()) <= 3 and t not in seen_set:
-                        seen_set.add(t)
-                        seen_list.append(t)
-            out[key] = [_pat(t) for t in seen_list]
-
-    return out
-
-def _scan_nested(cat: Dict[str, List[re.Pattern[str]]], food: str) -> List[str]:
-    return [c for c, ps in cat.items() if any(p.search(food) for p in ps)]
-
-def _scan_list(pats: List[re.Pattern[str]], label: str, food: str) -> List[str]:
-    return [label] if any(p.search(food) for p in pats) else []
-
-_TASKS: List[Tuple[str, object, str]] = [
-    ("biogenic_amine", _scan_nested, "biogenic_amines"),
-    ("salicylate", _scan_list, "salicylates"),
-    ("lectin", _scan_list, "lectins"),
-    ("metal", _scan_nested, "metals"),
-    ("additive", _scan_nested, "artificial_additives"),
-    ("other_trigger", _scan_nested, "other_common_triggers"),
-]
-
-def _analyse_one(food: str, data: Dict[str, object]) -> Tuple[str, List[str]]:
-    hits: List[str] = []
-    for lab, fn, key in _TASKS:
-        cat = data.get(key, {})
-        # preserve original signature dispatch
-        if fn is _scan_list:
-            hits.extend(_scan_list(cat, lab, food))  # type: ignore[arg-type]
-        else:
-            hits.extend(_scan_nested(cat, food))     # type: ignore[arg-type]
-
-    # de-dup preserve order
-    seen: set[str] = set()
-    uniq: List[str] = []
-    for h in hits:
-        if h not in seen:
-            seen.add(h)
-            uniq.append(h)
-    return food, uniq
-
-def analyse_triggers(names: Iterable[str] | str, parallel: bool = True, max_workers: Optional[int] = None) -> Dict[str, List[str]]:
-    """
-    Map input food names → trigger categories using the compiled DB.
-    Preserves all original semantics including parallel behavior and normalization.
-    """
-    foods: Tuple[str, ...]
-    if isinstance(names, str):
-        foods = tuple(x for x in (n.strip() for n in names.split(",")) if x)
-    else:
-        foods = tuple(str(f).strip() for f in names)
-
-    foods = tuple(_sg(f.lower()) for f in foods if f)
-    if not foods:
-        return {}
-
-    data = _db()
-    res: Dict[str, List[str]] = {}
-
-    if parallel and len(foods) > 1:
-        with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(_analyse_one, x, data) for x in foods]
-            for f in cf.as_completed(futs):
-                k, h = f.result()
-                res[k] = h
-    else:
-        for f in foods:
-            _, h = _analyse_one(f, data)
-            res[f] = h
-
-    return res
+    caption = _ollama_chat_caption(b64, num_predict=_CAP_TOK)
+    tokens = _caption2foods(caption) if caption else []
+    log.info("identify_food_items → %d tokens", len(tokens))
+    return tokens
