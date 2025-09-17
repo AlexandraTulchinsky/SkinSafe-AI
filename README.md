@@ -2,6 +2,8 @@
 
 Instantly analyze product ingredient lists with **multimodal AI** to determine if they’re safe for **eczema** and **malassezia**-prone skin.
 
+![Demo](demo.png)
+
 **Tech stack:**
 - **Backend:** Python 3.10+, FastAPI, Uvicorn, MongoDB, Ollama (for Llama models), Tesseract 
 - **AI/ML Models:** CLIP (image type gating), YOLOv8 (object detection/cropping), Llama 3 (LLM, vision LLM), EasyOCR, Tesseract OCR
