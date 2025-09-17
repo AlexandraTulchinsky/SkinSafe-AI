@@ -1,4 +1,4 @@
-## Ezeczema Analyzer — Backend
+## Eczema Analyzer — Backend
 
 FastAPI service that takes one image and returns ingredient advice (`safe` vs `avoid`) for eczema-prone users.
 
