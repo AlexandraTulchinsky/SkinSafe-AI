@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 SkinSafeAI — multi-class object detection (ingredient_list + barcode)
 
@@ -21,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Optional, List
 
-# Third-party dependencies
+
 try:
     import yaml
 except Exception:
@@ -47,21 +45,15 @@ except Exception:
 def _is_windows() -> bool:
     return os.name == "nt"
 
-
 def _workers_default() -> int:
-    # Windows dataloader/file watcher issues are common; default to 0 there.
     return 0 if _is_windows() else 8
 
 
 def _nearest_multiple_of_32(n: int) -> int:
     return int(round(n / 32)) * 32 or 32
 
-
 def _cuda_preflight(requested_device: str | int) -> str:
-    """
-    Verify CUDA availability if a GPU device was requested.
-    Returns the device string to pass to Ultralytics ('0', 'cpu', '0,1'), or exits with a clear error.
-    """
+
     dev_str = str(requested_device).strip().lower()
 
     if dev_str == "cpu":
@@ -83,22 +75,18 @@ def _cuda_preflight(requested_device: str | int) -> str:
         )
         sys.exit(1)
 
-    # Probe GPU 0 at least; Ultralytics will handle multi-GPU strings like '0,1'
     try:
         _ = torch.cuda.get_device_name(0)
     except Exception as e:
         print(f"Could not query CUDA device 0: {e}", file=sys.stderr)
         sys.exit(1)
 
-    torch.backends.cudnn.benchmark = True  # good default for fixed-size batches
+    torch.backends.cudnn.benchmark = True 
     return dev_str
 
 
 def find_data_yaml(dataset_root: Path) -> Path:
-    """
-    Find data.yaml under dataset_root.
-    Checks dataset_root/data.yaml first; if not found, searches recursively and returns the shallowest match.
-    """
+ 
     direct = dataset_root / "data.yaml"
     if direct.exists():
         return direct
@@ -126,12 +114,7 @@ def find_images_dir(dataset_root: Path, split: str) -> Optional[Path]:
 
 
 def check_dataset_integrity(dataset_root: Path, strict: bool = True) -> None:
-    """
-    Basic dataset checks:
-      - no segmentation-style labels (more than 5 numeric values on a line)
-      - label files point to an existing image
-    If strict=True, the function exits on violation.
-    """
+
     seg_like: list[Path] = []
     missing_images: list[Path] = []
 
@@ -139,7 +122,6 @@ def check_dataset_integrity(dataset_root: Path, strict: bool = True) -> None:
         labels_dir = dataset_root / split / "labels"
         images_dir = dataset_root / split / "images"
         if not labels_dir.exists() or not images_dir.exists():
-            # Allow missing split directories; Ultralytics also tolerates this.
             continue
 
         for label_file in labels_dir.glob("*.txt"):
@@ -150,11 +132,9 @@ def check_dataset_integrity(dataset_root: Path, strict: bool = True) -> None:
                         if not line:
                             continue
                         parts = line.split()
-                        # YOLO detect label line should have 5 numeric values
                         if len(parts) > 5:
                             seg_like.append(label_file)
                             break
-                        # sanity: numeric check
                         try:
                             _ = [float(x) for x in parts]
                         except ValueError:
@@ -164,8 +144,7 @@ def check_dataset_integrity(dataset_root: Path, strict: bool = True) -> None:
                 seg_like.append(label_file)
                 continue
 
-            # verify a matching image exists; YOLO allows images with no labels,
-            # but if a label exists there should be a corresponding image
+         
             stem = label_file.stem
             if not any((images_dir / f"{stem}{ext}").exists() for ext in (".jpg", ".jpeg", ".png")):
                 missing_images.append(label_file)
@@ -189,9 +168,6 @@ def check_dataset_integrity(dataset_root: Path, strict: bool = True) -> None:
             print("Warning: " + msg)
 
 
-# -------------------------
-# Training / Validation / Prediction
-# -------------------------
 def train_yolo(
     data_yaml: Path,
     pretrained: str,
@@ -229,15 +205,15 @@ def train_yolo(
             batch=int(batch),
             workers=int(workers),
             device=str(device_str),
-            save=True,            # saves to runs/detect/train{N}
+            save=True,          
             verbose=True,
-            amp=True,             # mixed precision when possible
+            amp=True,            
             resume=resume,
         )
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
             print(
-                "CUDA out of memory. Reduce --batch (e.g., 16->8->4) and/or --imgsz (640->512) and re-run.",
+                "CUDA out of memory.",
                 file=sys.stderr,
             )
         raise
@@ -260,9 +236,7 @@ def validate_model(best_weights: Path, data_yaml: Path, imgsz: int, device: str 
 
 
 def quick_predict(best_weights: Path, dataset_root: Path, conf: float = 0.25, device: str | int = "0") -> None:
-    """
-    Quick smoke-test: prefer test/images, else valid/images. Saves results to runs/detect/predict{N}.
-    """
+
     test_dir = find_images_dir(dataset_root, "test") or find_images_dir(dataset_root, "valid")
     if not test_dir:
         print("No test/images or valid/images directory found; skipping quick prediction.")
@@ -282,9 +256,8 @@ def quick_predict(best_weights: Path, dataset_root: Path, conf: float = 0.25, de
     print("Prediction complete. See runs/detect/predict*/")
 
 
-# -------------------------
-# CLI and entry point
-# -------------------------
+
+# Entry point
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train YOLO locally on SkinSafeAI (barcode + ingredient_list).")
 
@@ -304,7 +277,7 @@ def parse_args() -> argparse.Namespace:
 
     # Training hyperparameters
     p.add_argument("--pretrained", default="yolov8s.pt",
-                   help="YOLO pretrained weights (e.g., yolov8n.pt, yolov8s.pt, yolov11n.pt)")
+                   help="YOLO pretrained weights")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--imgsz", type=int, default=768)
     p.add_argument("--batch", type=int, default=16)
@@ -318,7 +291,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    # Basic file logging to keep a record of the run
+  
     logging.basicConfig(
         filename="train_log.txt",
         level=logging.INFO,
@@ -328,7 +301,6 @@ def main() -> None:
 
     args = parse_args()
 
-    # Argument sanity checks
     if args.batch <= 0:
         sys.exit("Batch size must be > 0")
     if args.imgsz <= 0:
@@ -351,10 +323,8 @@ def main() -> None:
     else:
         data_yaml = find_data_yaml(dataset_root)
 
-    # Basic dataset integrity checks
     check_dataset_integrity(dataset_root, strict=not args.no_strict_integrity)
 
-    # Show classes for confirmation
     class_names = read_classes_from_yaml(data_yaml)
     print(f"Classes in dataset: {class_names} (nc={len(class_names)})")
     if len(class_names) < 2:
@@ -372,10 +342,8 @@ def main() -> None:
         resume=args.resume,
     )
 
-    # Validate on val split
     validate_model(best_weights, data_yaml, imgsz=args.imgsz, device=args.device)
 
-    # Quick smoke-test prediction on test/images (or valid/images) if present
     quick_predict(best_weights, dataset_root, device=args.device)
 
 

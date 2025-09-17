@@ -1,24 +1,23 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 from pathlib import Path
 import cv2
 from ultralytics import YOLO
+import os
 
 # Path to your trained YOLO model
-MODEL_PATH = "C:/Users/alexandra.tulchinsky/OneDrive - Ross Video/Documents/personal_project/backend/roboflow/runs/detect/train/weights/best.pt"
+MODEL_PATH = os.getenv(
+    "YOLO_MODEL_PATH",
+    "runs/detect/train/weights/best.pt"  
+)
 
 # Initialize YOLO
 model = YOLO(MODEL_PATH)
 print("[YOLO DEBUG] model.names =", model.names, flush=True)
-def detect_and_crop(image_bgr, target_classes=None, conf=0.4):
+def detect_and_crop(image_bgr, target_classes=None, conf=0.1):
     """
     Run YOLO detection, crop detected regions, and return list of crops.
     """
     results = model.predict(source=image_bgr, conf=0.1, imgsz=768, verbose=False)
     print(f"[YOLO DEBUG] raw result boxes: {results[0].boxes}", flush=True)
-
-
 
     crops = []
     for r in results:

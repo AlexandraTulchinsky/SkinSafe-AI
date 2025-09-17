@@ -1,5 +1,3 @@
-# seed_mongo.py
-# ------------------------------------------------------------
 # Populate a local MongoDB with eczema trigger data from a
 # JSON file structured as:
 # {
@@ -24,7 +22,6 @@
 # Usage (Windows PowerShell):
 #   pip install pymongo
 #   python seed_mongo.py --json C:\path\to\cross_ref_food.json --db eczema_db --collection ingredients --drop
-# ------------------------------------------------------------
 
 import argparse
 import json
@@ -35,7 +32,7 @@ from typing import Dict, Iterable, List, Tuple, Any
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError
 
-# ---- Helper cleaning ---------------------------------------------------------
+# Helper cleaning 
 
 DELIMS = r"[,;/]|(?:\s+\band\b\s+)"
 
@@ -64,7 +61,7 @@ def parse_entry(raw: str) -> Tuple[str, List[str]]:
         examples = []
     return base.lower(), examples
 
-# ---- JSON traversal ----------------------------------------------------------
+# JSON traversal
 
 def walk_json(data: Dict[str, Any]) -> Iterable[Tuple[str, List[str], str, str, str]]:
     """
@@ -86,7 +83,7 @@ def walk_json(data: Dict[str, Any]) -> Iterable[Tuple[str, List[str], str, str, 
                 base, examples = parse_entry(item)
                 yield base, examples, group_l, group_l, group_l
 
-# ---- Mongo load --------------------------------------------------------------
+# Mongo load 
 
 def seed_mongo(
     records: Iterable[Tuple[str, List[str], str, str, str]],
@@ -159,7 +156,6 @@ def seed_mongo(
         for doc in col.find({}, {"_id": 0}).limit(sample):
             print(json.dumps(doc, default=str, ensure_ascii=False, indent=2))
 
-# ---- CLI ---------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="Seed local MongoDB from cross-ref food JSON.")

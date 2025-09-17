@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Simple ingredient-label OCR pipeline:
 1. EasyOCR first (fast, accurate on packaging)
@@ -27,7 +25,6 @@ try:
 except Exception:
     easyocr = None
 
-# ---------------------- config & logging ----------------------
 _MIN_SIDE = int(os.getenv("OCR_MIN_SIDE", "800"))
 _MIN_GOOD_TOK = int(os.getenv("OCR_MIN_GOOD_TOK", "3"))
 _TESS_TIMEOUT_S = max(0.1, float(os.getenv("OCR_TESS_TIMEOUT_MS", "1000")) / 1000.0)
@@ -50,7 +47,7 @@ _WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ,.;
 
 _SEPARATORS = r"[•·\*\+|;∙●◦/:]"
 
-# ---------------------- utils ----------------------
+# utils
 def _ensure_bgr(img: Union[str, Path, np.ndarray, Image.Image]) -> np.ndarray:
     if isinstance(img, (str, Path)):
         bgr = cv2.imread(str(img))
@@ -99,7 +96,7 @@ def _clean_and_split(block: str) -> List[str]:
 def _tokens_look_valid(tokens: List[str], min_good: int = _MIN_GOOD_TOK) -> bool:
     return sum(1 for t in tokens if re.search(r"[A-Za-z]{3,}", t)) >= min_good
 
-# ---------------------- OCR engines ----------------------
+#  OCR engines 
 _EASYREADER = None
 def _easyocr_tokens(bgr: np.ndarray) -> List[str]:
     global _EASYREADER
@@ -160,7 +157,7 @@ def _vision_tokens(bgr: np.ndarray) -> List[str]:
         log.warning("Vision fallback failed: %s", e)
         return []
 
-# ---------------------- public API ----------------------
+# API
 def extract_ingredients_label(img: Union[str, Path, np.ndarray, Image.Image]) -> List[str]:
     bgr = _ensure_bgr(img)
     bgr = _resize(bgr, _MIN_SIDE)

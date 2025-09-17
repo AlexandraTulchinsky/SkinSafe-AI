@@ -1,12 +1,10 @@
-#!/usr/bin/env python3
 import os
 from pathlib import Path
 
 # Root of your dataset
-DATASET_ROOT = Path("C:/Users/alexandra.tulchinsky/OneDrive - Ross Video/Documents/personal_project/backend_v0/roboflow/SkinSafeAI-2")
+DATASET_ROOT = Path(os.getenv("DATASET_ROOT", "./SkinSafeAI-2"))
 
 def is_segmentation_label(label_path: Path) -> bool:
-    """Return True if any line has more than 5 values (YOLO seg format)."""
     with open(label_path, "r") as f:
         for line in f:
             parts = line.strip().split()
@@ -15,7 +13,6 @@ def is_segmentation_label(label_path: Path) -> bool:
     return False
 
 def cleanup_split(split: str) -> int:
-    """Check labels in one split (train/valid/test), remove seg files + images. Return count removed."""
     split_dir = DATASET_ROOT / split
     labels_dir = split_dir / "labels"
     images_dir = split_dir / "images"
@@ -45,10 +42,9 @@ def main():
         removed = cleanup_split(split)
         total_removed[split] = removed
 
-    print("\n=== Cleanup Summary ===")
+    print("\n Cleanup Summary: \n")
     for split, count in total_removed.items():
         print(f"{split}: {count} files removed")
-    print("=======================")
 
 if __name__ == "__main__":
     main()

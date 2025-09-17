@@ -4,14 +4,12 @@
 # No trigger scanning or DB logic here — just vision -> caption -> tokens.
 #
 # Public API:
-#   - identify_food_items(img) -> List[str]
-#   - identify_food_items_batch(imgs, batch_size=8) -> List[List[str]]
+#   identify_food_items(img) -> List[str]
 #
 # Behavior:
 #   1) (Optional) Ask vision model if image is FOOD vs NOT_FOOD (cheap guard).
-#   2) Caption with Ollama (llama3.2-vision or your chosen vision model).
+#   2) Caption with Ollama (llama3.2-vision).
 #   3) Parse caption into short, singularized tokens (≤ 3 words), dedup, order-preserving.
-# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -30,9 +28,6 @@ import spacy
 import subprocess
 from PIL import Image
 
-# --------------------------------------------------------------------------------------
-# Env / logging
-# --------------------------------------------------------------------------------------
 
 LOG_LEVEL = os.getenv("STEP2_LOGLEVEL", "INFO").upper()
 logging.basicConfig(
@@ -42,9 +37,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("step2_food")
 
-# --------------------------------------------------------------------------------------
-# NLP helpers
-# --------------------------------------------------------------------------------------
 
 _inflect = inflect.engine()
 # keep spaCy config minimal (token POS tagging only)
@@ -59,24 +51,18 @@ def _sg(phrase: str) -> str:
     last = _inflect.singular_noun(parts[-1]) or parts[-1]
     return " ".join([*parts[:-1], last])
 
-# --------------------------------------------------------------------------------------
-# Ollama Vision configuration
-# --------------------------------------------------------------------------------------
 
-_CAP_TOK: int = int(os.getenv("VISION_CAP_TOK", "16"))  # small, concise captions
+_CAP_TOK: int = int(os.getenv("VISION_CAP_TOK", "16"))  
 
 _OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 _LLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2-vision:latest")
 
-# Warmup toggles (disable by setting 0)
 _WARMUP_OLLAMA = os.getenv("WARMUP_OLLAMA", "1") != "0"
 
-# Request timeout (ms → s)
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "10000000"))
 
-# --------------------------------------------------------------------------------------
+
 # Image utilities
-# --------------------------------------------------------------------------------------
 
 def _rgb(im: Image.Image | str | Path) -> Image.Image:
     """Ensure a PIL RGB image from path or Image."""
@@ -99,9 +85,7 @@ def _jpeg_b64_for_vision(img: Image.Image, max_side: int = 768, quality: int = 8
     im.save(buf, format="JPEG", quality=quality, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-# --------------------------------------------------------------------------------------
 # Vision model calls
-# --------------------------------------------------------------------------------------
 
 def _llama_caption_prompt() -> str:
     return (
@@ -146,9 +130,9 @@ def _vision_is_food(img_b64: str) -> Optional[bool]:
         "messages": [{"role": "user", "content": prompt, "images": [img_b64]}],
         "stream": False,
         "options": {
-            "num_predict": 3,      # tiny
+            "num_predict": 3,     
             "keep_alive": "30m",
-            "num_gpu": 0,          # force CPU for this model
+            "num_gpu": 0,          
         },
     }
     try:
@@ -200,9 +184,7 @@ def _ollama_chat_caption(img_b64: str, num_predict: int = _CAP_TOK) -> str:
             break
     return ""
 
-# --------------------------------------------------------------------------------------
 # Caption → tokens
-# --------------------------------------------------------------------------------------
 
 def _caption2foods(text: str) -> List[str]:
     """
@@ -247,9 +229,7 @@ def _caption2foods(text: str) -> List[str]:
 
     return tokens
 
-# --------------------------------------------------------------------------------------
-# Public API (PLAIN LIST ONLY)
-# --------------------------------------------------------------------------------------
+# API (PLAIN LIST ONLY)
 
 def identify_food_items(img: Image.Image | str | Path) -> List[str]:
     """
